@@ -186,7 +186,143 @@ std::deque<std::string> d = absl::StrSplit("a,b,c", ',');
 std::map<std::string, std::string> m = absl::StrSplit("a,1,b,2,c,3", ',');
 ```
 
-这里简要介绍(还没时间看原理),通过`string_view`指向输入的字符串,然后分割出来的`string_view`根据返回值类型,决定是否拷贝.
+这里简要介绍(还没时间看原理),通过`string_view`指向输入的字符串,然后分割出来的`string_view`根据返回值类型,决定是否拷贝.因此由于底层实现使用`string_view`，避免了拷贝，所以比较高效。
+
+## tips 10: 返回值策略
+
+`RVO(return value optimization)`是被大部分编译器实现的`feature`。
+
+```cpp
+static SomeBigObject SomeBigObjectFactory(...) {
+  SomeBigObject local;
+  ...
+  return local;
+}
+SomeBigObject obj = SomeBigObject::SomeBigObjectFactory(...);
+```
+
+由于`RVO`技术，`compiler`将调用者`obj`的地址直接传递给被调用者`SomeBigObjectFactory`。
+
+那么什么时候`compiler`不会使用`RVO`技术呢？
+
+```cpp
+// RVO won’t happen here; 调用  SomeBigObject& operator=(const SomeBigObject& s);
+obj = SomeBigObject::SomeBigObjectFactory(s2);
+// obj has been defined;
+```
+
+如果调用者重新使用一个值来存储返回值，则不会进行`RVO`。当然这种情况下，会在`move-enabled`类型内调用移动语义。
+
+```cpp
+// RVO won’t happen here:
+static SomeBigObject NonRvoFactory(...) {
+  SomeBigObject object1, object2;
+  object1.DoSomethingWith(...);
+  object2.DoSomethingWith(...);
+  if (flag) {
+    return object1;
+  } else {
+    return object2;
+  }
+}
+
+// RVO will happen here:
+SomeBigObject local;
+if (...) {
+  local.DoSomethingWith(...);
+  return local;
+} else {
+  local.DoSomethingWith(...);
+  return local;
+}
+```
+
+如果被调用者返回多个变量作为返回值，也不会做`RVO`。如果是使用一个变量但返回多个地方，则会做`RVO`。
+
+### temporaries
+
+此外，`RVO`不仅命名变量上生效，同样也在临时对象上生效，即调用者返回临时变量的情况。
+
+```cpp
+// RVO works here:
+SomeBigObject SomeBigObject::ReturnsTempFactory(...) {
+  return SomeBigObject::SomeBigObjectFactory(...);
+}
+
+// RVO works here:
+EXPECT_EQ(SomeBigObject::SomeBigObjectFactory(...).Name(), s);
+```
+
+当调用者立刻使用返回值(被存储在临时对象中)时，`RVO`也会生效。
+
+记住一句话，对代码需要`copy`，就会执行`copy`，不管`copy`会不会优化。不要为了高效而牺牲正确性。
+
+## tips 24: 拷贝
+
+当代码为同一个数据出现两个名字时，那就需要一份拷贝。
+如果你避免引入新名字,那么编译器可能会帮你去除掉拷贝。
+
+```cpp
+std::string build();
+
+std::string foo(std::string arg) {
+  return arg;  // no copying here, only one name for the data “arg”.
+}
+
+void bar() {
+  std::string local = build();  // only 1 instance -- only 1 name
+
+  // no copying, a reference won’t incur a copy
+  std::string& local_ref = local;
+
+  // one copy operation, there are now two named collections of data.
+  std::string second = foo(local);
+}
+```
+
+记住一句话
+
+> everything you learned about copies in C++ a decade ago is wrong.
+
+阅读c++ 白皮书的时候也发现，历史遗留问题改动还不小。
+
+
+## tips 36: New Join API
+
+了解下 `absl::StrJoin` 吧。它支持`std::string, absl::string_view, int, double – any type that absl::StrCat() supports`。
+
+```cpp
+std::vector<std::string> v = {"a", "b", "c"};
+std::string s = absl::StrJoin(v, "-");
+// s == "a-b-c"
+
+std::vector<absl::string_view> v = {"a", "b", "c"};
+std::string s = absl::StrJoin(v.begin(), v.end(), "-");
+// s == "a-b-c"
+
+std::vector<int> v = {1, 2, 3};
+std::string s = absl::StrJoin(v, "-");
+// s == "1-2-3"
+
+const int a[] = {1, 2, 3};
+std::string s = absl::StrJoin(a, "-");
+// s == "1-2-3"
+```
+
+如果你想`join`一个`StrCat`不支持的类型，就添加一个自定义`Formatter`。
+
+```cpp
+std::map<std::string, int> m = {{"a", 1}, {"b", 2}, {"c", 3}};
+std::string s = absl::StrJoin(m, ";", absl::PairFormatter("="));
+
+std::vector<Foo> foos = GetFoos();
+// use lambda as formatter
+std::string s = absl::StrJoin(foos, ", ", [](std::string* out, const Foo& foo) {
+  absl::StrAppend(out, foo.ToString());
+});
+```
+
+源码在[absl/strings/str_join.h](https://github.com/abseil/abseil-cpp/blob/master/absl/strings/str_join.h)。简而言之，就是对 tips 3中提到的`strings_internal`传递`$1`参数和`Formatter`做`join`计算。最后利用`strings_internal`拷贝到`string`。
 
 ## tips 186: 函数请放在匿名空间中
 
