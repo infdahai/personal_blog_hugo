@@ -2,7 +2,7 @@
 title: "C++_tips"
 date: 2022-05-27T23:29:05+08:00
 draft: false
-tags: ["C++","language"]
+tags: ["language"]
 category: ["C++"]
 author: "clundro"
 ---
