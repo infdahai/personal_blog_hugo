@@ -7,9 +7,11 @@ category: ["C++"]
 author: "clundro"
 ---
 
-本篇文章主要是对阅读 [google c++ tips](https://abseil.io/tips/) 后进行的总结与记录。
+本篇文章主要是对阅读 [google c++ tips](https://abseil.io/tips/) 后进行的盲目记录与总结。
 
 ## tips 1: `string_view`
+
+----
 
 将字符串传进函数，一般按如下方式。
 
@@ -18,7 +20,7 @@ author: "clundro"
 void TakesCharStar(const char* s);
 // Old Standard C++ convention
 void TakesString(const std::string& s);
-// string_view C++ conventions
+// string_view C++ conventions, from c++ 17
 void TakesStringView(std::string_view s);     
 ```
 
@@ -37,7 +39,7 @@ void AlreadyHasCharStar(const char* s) {
 }
 ```
 
-同时`string_view`有生命周期的概念，需要确保使用时间在原字符串生命期的内部。
+同时`string_view`本身不拥有数据，因此有生命周期的概念，需要确保使用时间在原字符串生命期的内部。
 
 当想使用一个字符串数据，但不会改动时，请使用`string_view`。如果要修改，则显示转化`std::string(string_view)`。
 
@@ -48,7 +50,143 @@ void AlreadyHasCharStar(const char* s) {
 ```cpp
 std::cout << "Took '" << s << "'";
 ```
-可以这样直接打印`string_view`。但由于`string_view`不一定`NUL-terminated`，因此不要用`s.data()`的写法。
+
+可以这样直接打印`string_view`。但由于`string_view`不一定`NUL-terminated`，因此不要用`s.data()`。
+
+
+## tips 3: StrCat() & StrAppend()
+
+---
+
+`string concat`即`std::string::operator+`是低效的。
+其中
+
+```cpp
+std::string foo = LongStr1(),bar = LongStr2(),baz = LongStr3();
+string foobar1 = foo + bar + baz; // 1
+std::string foobar2 = absl::StrCat(foo, bar, baz);  // 2
+```
+
+在两参数情况下，方式1和2效率相同。但由于没有进行三参数的重载，方式1会像下面处理。
+
+```cpp
+std::string temp = foo + bar;
+std::string foobar = std::move(temp)+baz;
+```
+
+注意到一点，`std::move(temp)+baz`自c++11开始等价于`std::move(temp.append(baz))`。因此可能出现一种情况，分配给`temp`的初始buffer不够囊括下`foobar`,则会导致新增的`reallocation`和`copy`，因此最坏情况`n`长度的`string`需要`O(n)`重分配时间。
+
+`absl::StrCat`位于[absl/strings/str_cat.h](https://github.com/abseil/abseil-cpp/blob/master/absl/strings/str_cat.h)。之后有机会好好介绍下函数的实现方式，这里简要介绍下。
+
+```cpp
+namespace absl{
+namespace strings_internal {
+template <size_t max_size>
+struct AlphaNumBuffer {
+  std::array<char, max_size> data;
+  size_t size;
+  };
+}
+class AlphaNum{
+ private:
+  absl::string_view piece_;
+  char digits_[numbers_internal::kFastToBufferSize];
+};
+
+} 
+```
+
+通过设置一个固定大小的数组来存储`internal`,之后用`AlphaNum`作为`StrCat()`和`StrAppend()`包装的类，用`piece_`和`digits_`来存储`strings_internal`的信息。参看.cc文件的实现，对于方式2实现的原理大概就是将所有`string`转换成`AlphaNum`,然后提前计算下所需要的`size`并创建`result`字符串，通过指向`result`末端的指针一一`memcpy`。总共需要一次预分配内存和多次局部拷贝。
+
+```cpp
+foobar += foo + bar + baz; // 1
+absl::StrAppend(&foobar, foo, bar, baz); //2
+```
+
+类似的原理实现`absl::StrAppend`。这俩函数支持`int32_t, uint32_t, int64_t, uint64_t, float, double, const char*, string_view`这些类型的转化。当然可以看出，节约的时间在于临时量的拷贝和多次重分配。
+
+## tips 5:消失的艺术
+
+```cpp
+const char* p1 = (s1 + s2).c_str();             // Avoid!
+const char* p2 = absl::StrCat(s1, s2).c_str();  // Avoid!
+```
+
+两种写法产生临时变量，通过`c_str()`拿到指针。但根据c++ 17标准，
+
+>Temporary objects are destroyed as the last step in evaluating the full-expression that (lexically) contains the point where they were created.” (A “full-expression” is “an expression that is not a subexpression of another expression”
+
+因此当语句的赋值结束后，临时变量销毁，生命周期的限制便会产生`dangling ptr`的问题。
+
+### option 1: 持有
+
+不如持有临时变量。临时变量在栈上创建，经过`rvo`(临时变量的`move`语义)，直接构建，而不需要拷贝临时变量。
+
+```cpp
+std::string tmp_1 = s1 + s2;
+std::string tmp_2 = absl::StrCat(s1, s2);
+```
+
+### option 2: 用引用指向临时变量
+
+根据c++ 17 标准，
+
+>The temporary to which the reference is bound or the temporary that is the complete object of a sub-object to which the reference is bound persists for the lifetime of the reference.
+
+用引用持有临时变量，并不会比 `option 1`更优，一般情况安全。但遇到`Exception`时，会有`dangling reference`的风险。
+
+```cpp
+const std::string& tmp_1 = s1 + s2;
+const std::string& tmp_2 = absl::StrCat(s1, s2);
+
+// If the compiler can see you’re storing a reference to a
+// temporary object’s internals, it will keep the whole
+// temporary object alive.
+
+//GeneratePerson() returns an object; GeneratePerson().name
+// is clearly a sub-object:
+const std::string& person_name = GeneratePerson().name; // safe
+
+//GenerateDiceRoll() returns an object; the compiler can’t tell
+// if GenerateDiceRoll().nickname() is a sub-object.
+const std::string& nickname = GenerateDiceRoll().nickname(); // BAD!
+```
+
+情况取决于编译器是否知晓临时变量内部值的引用需要维持。
+当然还有一种方式，不要返回对象。
+
+## tips 10: 精简地拆分字符串
+
+通常拆分字符串的函数会因为各种输入参数，输出参数和语义需求而弄出多个版本.
+谷歌于是造了一个统一的`absl::StrSplit()`函数,代码位于[absl/strings/str_split.h](https://github.com/abseil/abseil-cpp/blob/master/absl/strings/str_split.h).
+
+```cpp
+// Splits on commas. Stores in vector of string_view (no copies).
+std::vector<absl::string_view> v = absl::StrSplit("a,b,c", ',');
+
+// Splits on commas. Stores in vector of string (data copied once).
+std::vector<std::string> v = absl::StrSplit("a,b,c", ',');
+
+// Splits on literal string "=>" (not either of "=" or ">")
+std::vector<absl::string_view> v = absl::StrSplit("a=>b=>c", "=>");
+
+// Splits on any of the given characters (',' or ';')
+using absl::ByAnyChar;
+std::vector<std::string> v = absl::StrSplit("a,b;c", ByAnyChar(",;"));
+
+// Stores in various containers (also works w/ absl::string_view)
+std::set<std::string> s = absl::StrSplit("a,b,c", ',');
+std::multiset<std::string> s = absl::StrSplit("a,b,c", ',');
+std::list<std::string> li = absl::StrSplit("a,b,c", ',');
+
+// Equiv. to the mythical SplitStringViewToDequeOfStringAllowEmpty()
+std::deque<std::string> d = absl::StrSplit("a,b,c", ',');
+
+// Yields "a"->"1", "b"->"2", "c"->"3"
+std::map<std::string, std::string> m = absl::StrSplit("a,1,b,2,c,3", ',');
+```
+
+这里简要介绍(还没时间看原理),通过`string_view`指向输入的字符串,然后分割出来的`string_view`根据返回值类型,决定是否拷贝.
 
 ## tips 186: 函数请放在匿名空间中
 
