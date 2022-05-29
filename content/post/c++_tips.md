@@ -186,7 +186,7 @@ std::deque<std::string> d = absl::StrSplit("a,b,c", ',');
 std::map<std::string, std::string> m = absl::StrSplit("a,1,b,2,c,3", ',');
 ```
 
-这里简要介绍(还没时间看原理),通过`string_view`指向输入的字符串,然后分割出来的`string_view`根据返回值类型,决定是否拷贝.因此由于底层实现使用`string_view`，避免了拷贝，所以比较高效。
+**这里简要介绍,通过`string_view`指向输入的字符串,然后分割出来的`string_view`根据返回值类型,决定是否拷贝.因此由于底层实现使用`string_view`，避免了拷贝，所以比较高效。**
 
 ## tips 10: 返回值策略
 
@@ -323,6 +323,57 @@ std::string s = absl::StrJoin(foos, ", ", [](std::string* out, const Foo& foo) {
 ```
 
 源码在[absl/strings/str_join.h](https://github.com/abseil/abseil-cpp/blob/master/absl/strings/str_join.h)。简而言之，就是对 tips 3中提到的`strings_internal`传递`$1`参数和`Formatter`做`join`计算。最后利用`strings_internal`拷贝到`string`。
+
+## tips 42:最好用工厂函数初始化方法
+
+如果在当前环境禁用`exception`，则c++ `ctor`必须成功，毕竟没有通知`caller`构造失败的方法了。如果你使用`abort`，则会使整个程序崩溃，对于产品代码得不偿失。
+
+有一种简单的方式是提供`factory function`来创建和初始化`instance`，并返回它的指针或者`absl::optional`(Tips 123)，用`null`表示失败(option的做法有类型统一的好处)。
+
+```cpp
+// foo.h
+class Foo {
+ public:
+  // Factory method: creates and returns a Foo.
+  // May return null on failure.
+  static std::unique_ptr<Foo> Create();
+
+  // Foo is not copyable.
+  Foo(const Foo&) = delete;
+  Foo& operator=(const Foo&) = delete;
+
+ private:
+  // Clients can't invoke the constructor directly.
+  Foo();
+};
+
+// foo.c
+std::unique_ptr<Foo> Foo::Create() {
+  // Note that since Foo's constructor is private, we have to use new.
+  return absl::WrapUnique(new Foo());
+}
+```
+
+`Foo::Create()`只会暴露出成功初始化的对象，同时也能像初始化方法表达失败。工厂函数的另一个优点是它能返回`instances of any subclass of the return type`（使用`absl::optional`作为返回类型当然就不行了）。这允许你使用不同的实现时，而不需要更新用户代码。甚至根据用户输入，动态选择实现类。
+
+**这里说的做法大概是根据`Create()`函数的输入参数进行选择`impl`，返回参数的类型如果是指针的话，子类型也可以返回。**
+
+该方法的缺点是生成的是分配在堆上的对象，对`value-like`类在栈上工作不友好。当`derived class ctor`需要初始化`base class`时，工厂函数不能使用，因此初始化方法在基类的`protected API`中是必要的。
+
+**这里我所理解的工厂函数，是通过某个函数包装原函数的指针。该指针同时包含原函数是否执行成功的状态信息。**
+
+## tips 45: 库代码中避免 `Flags`
+
+在产品代码中`flags`的通常使用，尤其是在库代码中，是一个巨大的错误。
+
+`Flags`是全局变量时，只会让事情更糟。无法阅读代码知道变量的值，不知道多次版本更迭后`flag`值是否保持不变。
+
+谨慎使用`flag`。使用数字`flag`可以考虑变成`compile-time constants`。
+
+## tips 49:参数查找(Argument-Dependent Lookup)
+
+一个函数调用表达式，类似`func(a,b,c)`，没有`::`域名操作符时，称为非限定的（`unqualified`）。
+
 
 ## tips 186: 函数请放在匿名空间中
 
