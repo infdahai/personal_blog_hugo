@@ -53,7 +53,6 @@ std::cout << "Took '" << s << "'";
 
 可以这样直接打印`string_view`。但由于`string_view`不一定`NUL-terminated`，因此不要用`s.data()`。
 
-
 ## tips 3: StrCat() & StrAppend()
 
 ---
@@ -188,7 +187,7 @@ std::map<std::string, std::string> m = absl::StrSplit("a,1,b,2,c,3", ',');
 
 **这里简要介绍,通过`string_view`指向输入的字符串,然后分割出来的`string_view`根据返回值类型,决定是否拷贝.因此由于底层实现使用`string_view`，避免了拷贝，所以比较高效。**
 
-## tips 10: 返回值策略
+## tips 11: 返回值策略
 
 `RVO(return value optimization)`是被大部分编译器实现的`feature`。
 
@@ -208,7 +207,7 @@ SomeBigObject obj = SomeBigObject::SomeBigObjectFactory(...);
 ```cpp
 // RVO won’t happen here; 调用  SomeBigObject& operator=(const SomeBigObject& s);
 obj = SomeBigObject::SomeBigObjectFactory(s2);
-// obj has been defined;
+// obj was defined;
 ```
 
 如果调用者重新使用一个值来存储返回值，则不会进行`RVO`。当然这种情况下，会在`move-enabled`类型内调用移动语义。
@@ -255,7 +254,9 @@ EXPECT_EQ(SomeBigObject::SomeBigObjectFactory(...).Name(), s);
 
 当调用者立刻使用返回值(被存储在临时对象中)时，`RVO`也会生效。
 
-记住一句话，对代码需要`copy`，就会执行`copy`，不管`copy`会不会优化。不要为了高效而牺牲正确性。
+记住一句话，当代码需要时`copy`，就会执行`copy`，不管`copy`会不会优化。（意思是，这些地方依然需要`copy`语义，只是被`RVO`进行`copy`优化了 ）不要为了高效而牺牲正确性。
+
+**简单点，直接在局部函数中返回临时变量。**
 
 ## tips 24: 拷贝
 
@@ -285,7 +286,6 @@ void bar() {
 > everything you learned about copies in C++ a decade ago is wrong.
 
 阅读c++ 白皮书的时候也发现，历史遗留问题改动还不小。
-
 
 ## tips 36: New Join API
 
@@ -323,6 +323,8 @@ std::string s = absl::StrJoin(foos, ", ", [](std::string* out, const Foo& foo) {
 ```
 
 源码在[absl/strings/str_join.h](https://github.com/abseil/abseil-cpp/blob/master/absl/strings/str_join.h)。简而言之，就是对 tips 3中提到的`strings_internal`传递`$1`参数和`Formatter`做`join`计算。最后利用`strings_internal`拷贝到`string`。
+
+**简而言之，涉及到`string`操作的建议用`absl::string`**
 
 ## tips 42:最好用工厂函数初始化方法
 
@@ -370,10 +372,203 @@ std::unique_ptr<Foo> Foo::Create() {
 
 谨慎使用`flag`。使用数字`flag`可以考虑变成`compile-time constants`。
 
-## tips 49:参数查找(Argument-Dependent Lookup)
+**这里说的`flag`大概是一些宏定义或者用于标记性质的常量。**
 
-一个函数调用表达式，类似`func(a,b,c)`，没有`::`域名操作符时，称为非限定的（`unqualified`）。
+## tips 49:参数依赖的查找(Argument-Dependent Lookup)_unfinished
 
+一个函数调用表达式，类似`func(a,b,c)`，没有`::`域名操作符时，称为非限定的（`unqualified`），此时编译器会进行匹配函数声明的查找。
+>the set of search scopes is augmented by namespaces associated with the function argument types. This additional lookup is called Argument-Dependent Lookup (ADL).
+
+## tips 55: 命名计数和 `unique_ptr`
+
+通俗说，一个值的 `name` 表示任何值类型的变量(不是指针，也不是引用)，存在在任何作用域且持有某个特别的数据值。（对于专门的C++律师，我们说`name`一般指的是`lvalue`）由于`unique_ptr`特殊行为需求，我们需要确保任何`unique_ptr`持有的值都只有一个名字。
+
+需要注意的是，C++ 语言委员会为 std::unique_ptr 选择了一个非常恰当的名称。任何存储在`unique_ptr`的非空指针值 在任何时候都只能出现在一个`unique_ptr`中。标准库的设计符合这个要求。
+
+在每一行，计算在该点（无论是否在范围内）活动的名称的数量，这些名称引用包含相同指针的 std::unique_ptr。 如果您发现同一指针值属于多个名称的任何行，那就是错误！
+
+```cpp
+std::unique_ptr<Foo> NewFoo() {
+  return std::unique_ptr<Foo>(new Foo(1));
+}
+
+void AcceptFoo(std::unique_ptr<Foo> f) { f->PrintDebugString(); }
+
+void Simple() {
+  AcceptFoo(NewFoo());
+}
+
+void DoesNotBuild() {
+  std::unique_ptr<Foo> g = NewFoo();
+  AcceptFoo(g); // DOES NOT COMPILE!
+}
+
+void SmarterThanTheCompilerButNot() {
+  Foo* j = new Foo(2);
+  // Compiles, BUT VIOLATES THE RULE and will double-delete at runtime.
+  std::unique_ptr<Foo> k(j);
+  std::unique_ptr<Foo> l(j);
+}
+```
+
+在 `Simple()` 中，用 `NewFoo()` 分配的唯一指针只有一个可以引用它的名称：`AcceptFoo()` 中的名称“f”。
+
+将其与 `DoesNotBuild()` 进行对比：使用 `NewFoo()` 分配的唯一指针有两个引用它的名称：`DoesNotBuild()` 的“g”和 `AcceptFoo()` 的“f”。
+
+这就是常见的唯一性违规。在执行的任何给定点，std::unique_ptr 持有的任何值（或更一般地，任何仅移动类型）都只能由一个不同的名称引用。 任何看起来像引入附加名称的副本都是禁止的，并且不会编译：
+
+```cpp
+scratch.cc: error: call to deleted constructor of std::unique_ptr<Foo>'
+  AcceptFoo(g);
+```
+
+即使编译器没有捕捉到你，std::unique_ptr 的运行时行为也会。 任何时候你“超越”编译器（参见 `SmarterThanTheCompilerButNot()`）并引入多个 std::unique_ptr 名称，它可能会编译（目前），但你会遇到运行时内存问题。
+
+那么问题来了：**我们如何删除一个名字？** C++11 也为此提供了解决方案，形式为 std::move()。
+
+```cpp
+ void EraseTheName() {
+   std::unique_ptr<Foo> h = NewFoo();
+   AcceptFoo(std::move(h)); // Fixes DoesNotBuild with std::move
+}
+```
+
+对 std::move() 的调用实际上是一个名称擦除器：从概念上讲，您可以停止将“h”计算为指针值的名称。 这现在通过了 distinct-names 规则：在分配给 `NewFoo()` 的唯一指针上有一个名称（“h”），并且在对 `AcceptFoo()` 的调用中再次只有一个名称（“f”）。 通过使用 std::move()，我们保证在为它分配新值之前不会再次读取“h”。
+
+**简而言之， 多一个名字便多一分拷贝。`unique_ptr`只能用一个名字，如果想更换名字，就用`move`**
+
+## tips 163: 传递 `absl::optional` 参数
+
+c++ 17已经引入`optional`了。
+
+遇到个问题，我们需要一个函数能接受可能存在也可能不存在的参数。那么这时候可能使用`absl::optional`。但如果这个对象足够大以至于我们需要传递引用，那`absl::optional`就不好使了。
+
+```cpp
+void MyFunc(const absl::optional<Foo>& foo);  // Copies by value
+void MyFunc(absl::optional<const Foo&> foo);  // Doesn't compile
+```
+
+如上所示，第一个选项可能无法满足您的要求。 如果有人将 Foo 传递给 MyFunc，Foo 将按值复制到 `absl::optional<Foo>`，然后将通过引用传递给函数。 如果您的目标是避免复制 Foo，那么您没有。
+
+第二个选项会很棒，但不幸的是 absl::optional 不支持。（这篇文章2020-4-6更新的，不知道现在如何）
+
+这时候，我们可以传递`const *`用`nullptr`代表不存在。
+
+```cpp
+void MyFunc(const Foo* foo);
+```
+
+这样和`const Foo&`传递一样高效，且支持空值。
+
+std::optional 的文档指出，您可以使用 std::reference_wrapper 来解决不支持可选引用的事实：
+
+```cpp
+void MyFunc(absl::optional<std::reference_wrapper<const Foo>> foo);
+```
+
+类似这样，但这太长且不易阅读，因此我们不推荐。
+
+因此**总结一下，如果您拥有可选的东西，则可以使用 absl::optional 。 例如，类成员和函数返回值通常适用于 absl::optional。 如果您不拥有可选的东西(即存在空的情况)，只需使用指针，如上所述。**
+
+异常的问题，如果您的对象足够小以至于不需要通过引用，您可以将对象包装在 absl::optional 中,例如
+
+```cpp
+void MyFunc(absl::optional<int> bar);
+```
+
+如果希望你的函数的所有调用者已经在 absl::optional 中有一个对象，那么你可以使用 const absl::optional&。 但是，这种情况很少见； 它通常仅在您的函数在您自己的文件/库中是私有的时才会发生。
+
+## tips 166: 什么时候 `Copy is not a Copy`
+
+从c++ 17 开始，对象可能被原地创建。
+
+```cpp
+class BigExpensiveThing {
+ public:
+  static BigExpensiveThing Make() {
+    // ...
+    return BigExpensiveThing();
+  }
+  // ...
+ private:
+  BigExpensiveThing();
+  std::array<OtherThing, 12345> data_;
+};
+
+BigExpensiveThing MakeAThing() {
+  return BigExpensiveThing::Make();
+}
+
+void UseTheThing() {
+  BigExpensiveThing thing = MakeAThing();
+  // ...
+}
+```
+
+在 C++17 之前，上面拷贝或移动对象的次数最多为三个：每个 return 语句一个，初始化事物时还有一个。 这是有道理的：每个函数都可能将 BigExpensiveThing 放在不同的位置，因此可能需要移动以将值放在最终调用者想要的位置。 然而，在实践中，对象总是在变量 thing 中“就地”构建，不执行任何移动，并且 C++ 语言规则允许“省略”这些移动操作以促进这种优化。
+
+在 C++17 中，保证此代码执行零复制或移动。 事实上，即使 BigExpensiveThing 不可移动，上面的代码也是有效的。 BigExpensiveThing::Make 中的构造函数调用直接构造了UseTheThing 中的局部变量`thing`。
+
+编译器看到`BigExpensiveThing()`时，并不会立即创建临时变量。
+相反，它将该表达式视为有关如何初始化某些最终对象的指令，但会尽可能长时间地推迟创建（正式地，“物化”）临时对象。
+
+通常，对象的创建会延迟到对象被命名。 命名对象（上例中的 `thing`）使用通过评估初始化程序找到的指令直接初始化。 如果名称是引用，则将物化一个临时对象来保存该值。
+
+因此，对象直接在正确的位置构造，而不是在其他地方构造然后复制。 这种行为有时被称为“保证复制省略”(`guaranteed copy elision`)，但这是不准确的：一开始就没有副本。
+
+**简而言之，对象在首次命名之前不会被复制。通过值返回没有额外开销。**
+
+(并且根据tips 11,即使在给定名称之后，由于nrvo，局部变量在从函数返回时仍可能不会被复制)
+
+### 那么有一个问题，什么时候未命名对象被拷贝呢？
+
+在两种 corner case下，使用未命名对象无论如何都会导致副本
+
+构造基类：在构造函数的基类初始值设定项列表中，即使从基类类型的未命名表达式构造时也会进行复制。 这是因为类在用作基类时可能会有一些不同的布局和表示（由于 virtual base classes和 vpointer 值），因此直接初始化基类可能不会导致正确的表示
+
+```cpp
+class DerivedThing : public BigExpensiveThing {
+ public:
+  DerivedThing() : BigExpensiveThing(MakeAThing()) {}  // might copy data_
+};
+```
+
+传递或返回小的平凡对象(trivial objects)：当一个足够小的可平凡复制的对象被传递给函数或从函数返回时，它可能会在寄存器中传递，因此在传递之前和之后可能有不同的地址。
+
+```cpp
+struct Strange {
+  int n;
+  int *p = &n;
+};
+void f(Strange s) {
+  CHECK(s.p == &s.n);  // might fail
+}
+void g() { f(Strange{0}); }
+```
+
+### 还有一个细节，什么是  Value Category （值的范畴）
+
+在C++中有两种表述。
+
+1. 产生值的那些词，例如 1 或 MakeAThing() - 您可能认为具有非引用类型的表达式。
+
+2. 那些产生一些现有对象的位置的词，例如 s 或 thing.data_[5] - 您可能认为具有引用类型的表达式。
+
+这种划分为`value category`。前者是`prvalue`,后者是`glvalue`。我们前面所说的未命名对象即为`prvalue`.
+
+所有纯右值表达式都在确定它们将值放在哪里的上下文中进行评估，并且纯右值表达式的执行用它的值初始化那个位置。
+
+```cpp
+ BigExpensiveThing thing = MakeAThing();
+```
+
+prvalue 表达式 MakeAThing() 被评估为`thing`变量的初始化程序，因此 MakeAThing() 将直接初始化`thing`。 构造函数将指向`thing`的指针传递给 MakeAThing()，并且 MakeAThing() 中的 return 语句初始化指针指向的内容。
+
+```Cpp
+return BigExpensiveThing();
+```
+
+相似的，编译器有一个指向要初始化的对象的指针，并通过调用 BigExpensiveThing 构造函数直接初始化该对象。
 
 ## tips 186: 函数请放在匿名空间中
 
@@ -391,4 +586,3 @@ void func1(){}
 
 当新加一个函数时，默认让它成为调用的.cc文件中的非成员函数。
 如果有别的选择时，请放在匿名空间吧。
-
