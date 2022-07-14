@@ -20,3 +20,4 @@ hugo.linux
 # End of https://www.toptal.com/developers/gitignore/api/hugo
 
 .vscode
+out
